@@ -28,6 +28,20 @@ use crate::prober::Prober;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 主动心跳间隔。
+///
+/// 跨境长链路（港台 agent ↔ 德国面板）上连接会被中间设备**静默掐断**：
+/// 不发 RST、包直接黑洞。原先没有心跳也没有超时，agent 会卡在 send 上
+/// 等 TCP 重传放弃（默认十几分钟），这期间面板上一直是离线。
+/// 面板（axum / tungstenite）会自动回 Pong，所以老版本面板也兼容。
+const HEARTBEAT: Duration = Duration::from_secs(20);
+/// 这么久没收到面板的任何帧（含 Pong）就判定连接已死、主动重连。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 单次发送上限。
+const SEND_TIMEOUT: Duration = Duration::from_secs(20);
+/// 建连（TCP + TLS + WS 握手）上限。SYN 被黑洞时默认要等两分多钟。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct Config {
     /// 形如 `ws://127.0.0.1:25774` 或 `wss://panel.example.com`
     server: String,
@@ -205,7 +219,14 @@ async fn main() -> Result<()> {
     }
 
     loop {
-        let result = run_session(&cfg, &mut collector, pending.as_ref(), &committed).await;
+        let result = run_session(
+            &cfg,
+            &mut collector,
+            pending.as_ref(),
+            &committed,
+            &mut backoff,
+        )
+        .await;
 
         match result {
             Ok(SessionEnd::Upgraded) => {
@@ -285,6 +306,7 @@ async fn run_session(
     collector: &mut Platform,
     pending: Option<&update::state::Pending>,
     committed: &std::sync::atomic::AtomicBool,
+    backoff: &mut Backoff,
 ) -> Result<SessionEnd> {
     let url = cfg.ws_url();
     let mut req = url
@@ -305,10 +327,11 @@ async fn run_session(
         Some(path) => Some(tls_connector(path)?),
         None => None,
     };
-    let (stream, resp) =
-        tokio_tungstenite::connect_async_tls_with_config(req, None, false, connector)
-            .await
-            .with_context(|| format!("连接 {url} 失败"))?;
+    let connecting = tokio_tungstenite::connect_async_tls_with_config(req, None, false, connector);
+    let (stream, resp) = match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+        Ok(r) => r.with_context(|| format!("连接 {url} 失败"))?,
+        Err(_) => bail!("连接 {url} 超时（{} 秒）", CONNECT_TIMEOUT.as_secs()),
+    };
     info!(status = ?resp.status(), "已连接");
 
     let (mut tx, mut rx) = stream.split();
@@ -322,7 +345,9 @@ async fn run_session(
     // 面板据此显示「可升级」还是「需手动升级」—— 必须如实。
     hello.capabilities.self_update = cfg.self_update_ready();
     log_capabilities(&hello.capabilities);
-    tx.send(to_msg(&AgentMsg::Hello(hello))?).await?;
+    send(&mut tx, to_msg(&AgentMsg::Hello(hello))?)
+        .await
+        .context("发送 Hello 失败")?;
 
     let mut runtime = RuntimeConfig::default();
     let mut ticker = new_ticker(runtime.interval_s);
@@ -330,31 +355,47 @@ async fn run_session(
     let mut prober = Prober::new(icmp_available);
     let mut ping_ticker = tokio::time::interval(Duration::from_secs(1));
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat =
+        tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_rx = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let m = collector.sample(&runtime);
                 debug!(cpu_pct = m.cpu_pct, rx = m.net.rx_speed, tx = m.net.tx_speed, "上报");
-                tx.send(to_msg(&AgentMsg::Metrics(m))?).await.context("发送指标失败")?;
+                send(&mut tx, to_msg(&AgentMsg::Metrics(m))?).await.context("发送指标失败")?;
+            }
+
+            _ = heartbeat.tick() => {
+                let idle = last_rx.elapsed();
+                if idle > IDLE_TIMEOUT {
+                    bail!("心跳超时：{} 秒没收到面板的任何数据，判定连接已死", idle.as_secs());
+                }
+                send(&mut tx, Message::Ping(Default::default())).await.context("发送心跳失败")?;
             }
 
             _ = ping_ticker.tick(), if prober.has_tasks() => {
                 if let Some(batch) = prober.tick(std::time::Instant::now()).await {
                     debug!(count = batch.len(), "上报延迟结果");
-                    tx.send(to_msg(&AgentMsg::PingResults { results: batch })?).await
+                    send(&mut tx, to_msg(&AgentMsg::PingResults { results: batch })?).await
                         .context("发送延迟结果失败")?;
                 }
             }
 
             incoming = rx.next() => {
+                // 任何帧都算面板还活着，包括 Pong
+                if let Some(Ok(_)) = &incoming {
+                    last_rx = tokio::time::Instant::now();
+                }
                 match incoming {
                     None => {
                         // 断开前把攒着的结果尽量发出去，别白探一场
                         let left = prober.drain();
                         if !left.is_empty() {
                             debug!(count = left.len(), "连接关闭前补发延迟结果");
-                            let _ = tx.send(to_msg(&AgentMsg::PingResults { results: left })?).await;
+                            let _ = send(&mut tx, to_msg(&AgentMsg::PingResults { results: left })?).await;
                         }
                         return Ok(SessionEnd::Closed);
                     }
@@ -369,6 +410,10 @@ async fn run_session(
                         match serde_json::from_str::<ServerMsg>(txt.as_str()) {
                             Ok(ServerMsg::Welcome(w)) => {
                                 info!(server_time = w.server_time, interval_s = w.interval_s, "收到 Welcome");
+                                // 真正连上了才把退避拉回起点。原先只在「正常关闭」时 reset，
+                                // 而跨境链路上会话几乎总是以错误结束 —— 连着跑了几个小时的
+                                // 会话断掉后，还沿用之前失败累积的退避，一等就是 5 分钟
+                                backoff.reset();
                                 // 连上了 = 新版本可用。提交更新、删掉备份与状态文件。
                                 // 先置标志再落盘：看门狗只看标志，
                                 // 反过来的话它可能在两步之间醒来，把一次成功的更新回滚掉。
@@ -433,4 +478,18 @@ fn new_ticker(interval_s: u8) -> tokio::time::Interval {
 
 fn to_msg(m: &AgentMsg) -> Result<Message> {
     Ok(Message::Text(serde_json::to_string(m)?.into()))
+}
+
+/// 带超时的发送。链路被黑洞时 send 会卡在 TCP 重传上，不设上限要十几分钟才报错。
+async fn send<S>(tx: &mut S, m: Message) -> Result<()>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match tokio::time::timeout(SEND_TIMEOUT, tx.send(m)).await {
+        Ok(r) => Ok(r?),
+        Err(_) => bail!(
+            "发送超时（{} 秒），链路可能已被掐断",
+            SEND_TIMEOUT.as_secs()
+        ),
+    }
 }

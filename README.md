@@ -87,11 +87,26 @@ token 不做成命令行参数的原因很简单：命令行对同机任何用�
 
 推荐从 Pulse Server 的 Dashboard 获取安装命令，那里会带好地址和该机器的 token：
 
-```bash
-curl -fsSL https://panel.example.com/install.sh | sudo bash -s -- \
+```sh
+U=https://panel.example.com/install.sh
+(curl -fsSL $U || wget -qO- $U) | $(command -v sudo) sh -s -- \
   --server wss://panel.example.com \
   --token <TOKEN>
 ```
+
+同一条命令适用于 Debian 系（systemd）和 Alpine（OpenRC）：没有 curl 时退回 wget，
+没有 sudo 时直接以 root 执行，脚本是 POSIX sh、不需要 bash。
+
+**升级 / 卸载**（在探针所在的机器上）：
+
+```sh
+# 升级到最新版：不带参数，沿用机器上原有的 token 与配置
+(curl -fsSL $U || wget -qO- $U) | $(command -v sudo) sh -s --
+# 卸载
+(curl -fsSL $U || wget -qO- $U) | $(command -v sudo) sh -s -- --uninstall
+```
+
+升级不要去后台重新「生成安装命令」—— 那会让旧 token 当场作废。
 
 安装脚本由 Server 提供（它要按每台机器生成 token），脚本本身在
 [Server 仓库](https://github.com/pulse-monitor/pulse/blob/main/deploy/scripts/install.sh)。
