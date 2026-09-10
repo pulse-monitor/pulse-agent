@@ -2,7 +2,12 @@
 //!
 //! 用 `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` —— 这是**不需要
 //! `CAP_NET_RAW`** 的那种 ICMP socket，只要内核的 `net.ipv4.ping_group_range`
-//! 覆盖运行用户的 gid 即可（Darwin 上默认可用）。
+//! 覆盖运行用户的 gid 即可。
+//!
+//! **只有 Linux 会走到这里。** macOS 没有 ping_group_range、Windows 也没有对应
+//! 机制，两者的 `icmp_unprivileged` 直接报 false，延迟监控回落 TCP。
+//!（这里原先写着「Darwin 上默认可用」，与 collect/macos.rs 里的 false 矛盾 ——
+//! 以 macos.rs 为准。）
 //!
 //! 调用方必须先确认 `Capabilities::icmp_unprivileged`；不可用时上层会回落 TCP。
 
