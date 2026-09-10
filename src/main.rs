@@ -46,6 +46,23 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
+        // 配置全部走环境变量，一个命令行参数都不接受。
+        //
+        // 但**不能默默忽略**多余的参数：安装脚本的 --server / --token 这些是
+        // 给脚本本身用的，有人照着抄到二进制上时，静默忽略的后果是它连去
+        // 默认端口然后 401，排查半天才发现参数根本没生效（实测踩到）。
+        // 直接报错并指出对应的环境变量。
+        let extra: Vec<String> = std::env::args().skip(1).collect();
+        if !extra.is_empty() {
+            bail!(
+                "pulse-agent 不接受命令行参数，收到：{}\n\
+                 配置请用环境变量：PULSE_SERVER、PULSE_TOKEN、PULSE_AUTO_UPDATE、\n\
+                 PULSE_UPDATE_BASE、PULSE_CA_CERT。\n\
+                 --server、--token 这类参数是**安装脚本**的，不是本程序的。",
+                extra.join(" ")
+            );
+        }
+
         // Token 只从环境变量读，**不接受命令行参数** —— 命令行对同机任何用户
         // 都可以通过 `ps` 看到。
         let token = std::env::var("PULSE_TOKEN").context(
