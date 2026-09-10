@@ -11,12 +11,15 @@
 # Agent 去哪找：
 #
 #   docker run -d --name pulse-agent --restart=always \
-#     --network host --pid host -v /:/rootfs:ro,rslave \
+#     --network host --pid host -v /:/rootfs:ro \
 #     -e PULSE_SERVER=wss://... -e PULSE_TOKEN=... -e PULSE_ROOTFS=/rootfs \
 #     ghcr.io/pulse-monitor/pulse-agent:latest
 #
 # **不需要 --privileged** —— 只读挂载就够。Server 后台生成的命令里已经带好
 # 这些参数，照抄即可。
+#
+# 不使用 rslave：Alpine 的宿主根目录通常是 private mount，指定该传播模式
+# 会让 Docker 在创建容器前失败。Agent 不需要追踪启动后新增的挂载点。
 
 # --platform=$BUILDPLATFORM + 交叉编译，不用 QEMU。
 # musl 静态链接 + zig 的交叉工具链：ring 的 build script 需要目标平台的

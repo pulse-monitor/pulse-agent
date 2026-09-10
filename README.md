@@ -100,7 +100,7 @@ curl -fsSL https://panel.example.com/install.sh | sudo bash -s -- \
 
 ```bash
 docker run -d --name pulse-agent --restart=always \
-  --network host --pid host -v /:/rootfs:ro,rslave \
+  --network host --pid host -v /:/rootfs:ro \
   -e PULSE_SERVER=wss://panel.example.com -e PULSE_TOKEN=<TOKEN> \
   -e PULSE_ROOTFS=/rootfs \
   ghcr.io/pulse-monitor/pulse-agent:latest
