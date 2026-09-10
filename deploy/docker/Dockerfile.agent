@@ -1,26 +1,46 @@
-# Pulse 探针镜像。
+# Pulse Agent 镜像。
 #
-# 基于 scratch：agent 是静态链接的 musl 二进制，**不需要 shell、不需要包管理器**。
+# 基于 scratch：Agent 是静态链接的 musl 二进制，**不需要 shell、不需要包管理器**。
 # 顺带消除了「攻击者拿到容器后 docker exec 进去」的可能 —— 里面没有 shell 可执行。
 #
 # 构建（在仓库根目录）：
 #   docker build -f deploy/docker/Dockerfile.agent -t pulse-agent .
 #
-# ⚠️ 本文件尚未在真实 Docker 环境验证过（开发机上没装 Docker）。
+# 要采到**宿主机**的指标，容器必须能看到宿主的 /proc、/sys 和磁盘。做法是
+# --network host + --pid host + 只读挂载宿主根目录，再用 PULSE_ROOTFS 告诉
+# Agent 去哪找：
+#
+#   docker run -d --name pulse-agent --restart=always \
+#     --network host --pid host -v /:/rootfs:ro,rslave \
+#     -e PULSE_SERVER=wss://... -e PULSE_TOKEN=... -e PULSE_ROOTFS=/rootfs \
+#     ghcr.io/pulse-monitor/pulse-agent:latest
+#
+# **不需要 --privileged** —— 只读挂载就够。Server 后台生成的命令里已经带好
+# 这些参数，照抄即可。
 
-FROM --platform=$BUILDPLATFORM rust:1.98-alpine AS builder
+# --platform=$BUILDPLATFORM + 交叉编译，不用 QEMU。
+# musl 静态链接 + zig 的交叉工具链：ring 的 build script 需要目标平台的
+# C 编译器，zig 一个顶全部目标，比装若干套 musl-cross 轻得多。
+FROM --platform=$BUILDPLATFORM rust:1.90-bookworm AS builder
 ARG TARGETARCH
-RUN apk add --no-cache musl-dev
 WORKDIR /src
+
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) echo x86_64-unknown-linux-musl  > /target.txt ;; \
+      arm64) echo aarch64-unknown-linux-musl > /target.txt ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$(cat /target.txt)"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends python3-pip; \
+    rm -rf /var/lib/apt/lists/*; \
+    pip3 install --no-cache-dir --break-system-packages ziglang; \
+    cargo install cargo-zigbuild --locked
+
 COPY . .
-RUN case "$TARGETARCH" in \
-      amd64) T=x86_64-unknown-linux-musl ;; \
-      arm64) T=aarch64-unknown-linux-musl ;; \
-      *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
-    esac && \
-    rustup target add "$T" && \
-    cargo build --release -p pulse-agent --target "$T" --locked && \
-    cp "target/$T/release/pulse-agent" /pulse-agent
+RUN cargo zigbuild --release --locked --target "$(cat /target.txt)" \
+ && cp "target/$(cat /target.txt)/release/pulse-agent" /pulse-agent
 
 FROM scratch
 COPY --from=builder /pulse-agent /pulse-agent
