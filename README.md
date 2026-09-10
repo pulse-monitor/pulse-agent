@@ -45,9 +45,43 @@ Server 能收到 Agent 上报的数据，但**不能通过 Pulse 获得对服务
 | 进程数 | 三平台 |
 | 网络延迟与丢包 | 由 Server 下发探测目标 |
 | CPU 温度 | **仅 Linux**（`/sys/class/hwmon`）。Windows 要 WMI + 管理员、macOS 要 SMC 特权访问，两者按最小权限原则都不做，如实上报「不可用」 |
-| GPU | **需要以 `--features gpu` 构建**，默认关闭。走 NVML 动态加载，不调用 `nvidia-smi` 子进程 |
+| GPU | **官方发布的二进制采不了**，见下 |
 
 采不到的指标一律**如实标记为不可用**，不用 0 填充 —— 前端会隐藏那一行，而不是显示一个假的 0。
+
+## GPU
+
+官方二进制是 **musl 静态链接**的，而 GPU 采集要动态加载 NVML
+（`libnvidia-ml.so.1`）—— 静态链接的程序没法 `dlopen`，所以这条路在发布版里
+走不通，`capabilities.gpu_nvml` 会如实报 `false`。
+
+按 R18 的要求，Agent **绝不调用 `nvidia-smi` 子进程**，所以也没有退路可走。
+
+要用就自己编一个动态链接的：
+
+```bash
+cargo build --release --features gpu --target x86_64-unknown-linux-gnu
+```
+
+有 NVIDIA 驱动时自动认出，没有时静默降级、如实报 false。代价是依赖宿主机的
+glibc，不像 musl 静态版那样一个文件到处跑。
+
+## 配置
+
+**一个命令行参数都不接受**，全走环境变量：
+
+| 变量 | 说明 |
+|---|---|
+| `PULSE_SERVER` | Server 地址，如 `wss://panel.example.com`。默认 `ws://127.0.0.1:25774` |
+| `PULSE_TOKEN` | 该机器的凭据（必填） |
+| `PULSE_AUTO_UPDATE` | 设成 `0` 关掉自更新 |
+| `PULSE_UPDATE_BASE` | 自更新的下载源，不设则自更新不可用 |
+| `PULSE_CA_CERT` | 额外信任的 CA 证书（Server 用私有 CA / 自签证书时） |
+
+token 不做成命令行参数的原因很简单：命令行对同机任何用户都能通过 `ps` 看到。
+
+给了参数会**直接报错**，不会被静默忽略 —— 否则它会连去默认端口然后一直 401，
+日志里完全看不出参数没生效。`--server`、`--token` 这些是**安装脚本**的参数。
 
 ## 安装
 
@@ -61,7 +95,21 @@ curl -fsSL https://panel.example.com/install.sh | sudo bash -s -- \
 
 安装脚本由 Server 提供（它要按每台机器生成 token），脚本本身在
 [Server 仓库](https://github.com/pulse-monitor/pulse/blob/main/deploy/scripts/install.sh)。
-手动安装见[文档](https://pulse-doc.pages.dev/install/agent)。
+
+也可以用 Docker（后台同样会生成命令）：
+
+```bash
+docker run -d --name pulse-agent --restart=always \
+  --network host --pid host -v /:/rootfs:ro,rslave \
+  -e PULSE_SERVER=wss://panel.example.com -e PULSE_TOKEN=<TOKEN> \
+  -e PULSE_ROOTFS=/rootfs \
+  ghcr.io/pulse-monitor/pulse-agent:latest
+```
+
+镜像基于 `scratch`，**里面没有 shell**，以 uid 65532 运行，**不需要 --privileged**。
+`linux/amd64` 与 `linux/arm64` 都有。
+
+各参数的作用与手动安装见[文档](https://pulse-doc.pages.dev/install/agent)。
 
 ## 连接
 
