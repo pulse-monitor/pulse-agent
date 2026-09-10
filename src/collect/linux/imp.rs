@@ -42,6 +42,20 @@ impl Roots {
     fn read(&self, base: &Path, rel: &str) -> Option<String> {
         std::fs::read_to_string(base.join(rel)).ok()
     }
+
+    /// 读 rootfs 下的文件。没配 rootfs 时就是读本机的绝对路径。
+    ///
+    /// 给 /etc/os-release 这类**发行版信息**用：Agent 镜像基于 scratch，
+    /// 容器里根本没有 /etc/os-release，sysinfo 读不到就只能回退成 "Linux"，
+    /// 面板上系统那一栏因此一直是空的（实测踩到）。
+    fn rooted(&self, rel: &str) -> Option<String> {
+        let base = if self.rootfs.as_os_str().is_empty() {
+            Path::new("/")
+        } else {
+            self.rootfs.as_path()
+        };
+        std::fs::read_to_string(base.join(rel.trim_start_matches('/'))).ok()
+    }
     fn proc(&self, rel: &str) -> Option<String> {
         self.read(&self.proc, rel)
     }
@@ -297,7 +311,15 @@ impl Collector for LinuxCollector {
 
         Facts {
             hostname: sysinfo::System::host_name().unwrap_or_else(|| "unknown".into()),
-            os: sysinfo::System::long_os_version().unwrap_or_else(|| "Linux".into()),
+            // 先看 rootfs 下的 os-release —— 容器里 sysinfo 读的是**容器自己的**
+            // /etc/os-release，而 scratch 镜像里没有这个文件，只会回退成 "Linux"
+            os: self
+                .roots
+                .rooted("etc/os-release")
+                .as_deref()
+                .and_then(parse::os_pretty_name)
+                .or_else(sysinfo::System::long_os_version)
+                .unwrap_or_else(|| "Linux".into()),
             kernel: sysinfo::System::kernel_version(),
             arch: sysinfo::System::cpu_arch(),
             cpu_model: cpuinfo.as_deref().and_then(parse::cpu_model),

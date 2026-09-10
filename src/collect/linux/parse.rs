@@ -609,3 +609,52 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic hypervisor lahf_lm
         assert!(!ping_group_allows("garbage", &[1000]));
     }
 }
+
+/// 从 `/etc/os-release` 里取 `PRETTY_NAME`。
+///
+/// 格式是 `KEY=VALUE`，值可能带引号。取不到 PRETTY_NAME 时退而取 NAME，
+/// 都没有就返回 None 让调用方继续降级。
+pub fn os_pretty_name(raw: &str) -> Option<String> {
+    let pick = |key: &str| {
+        raw.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|v| !v.is_empty())
+    };
+    pick("PRETTY_NAME=").or_else(|| pick("NAME="))
+}
+
+#[cfg(test)]
+mod os_release_tests {
+    use super::*;
+
+    const DEBIAN: &str = r#"PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+NAME="Debian GNU/Linux"
+VERSION_ID="13"
+ID=debian
+"#;
+
+    #[test]
+    fn reads_pretty_name_and_strips_quotes() {
+        assert_eq!(
+            os_pretty_name(DEBIAN).as_deref(),
+            Some("Debian GNU/Linux 13 (trixie)")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_name() {
+        assert_eq!(
+            os_pretty_name("NAME=\"Alpine Linux\"\nID=alpine\n").as_deref(),
+            Some("Alpine Linux")
+        );
+    }
+
+    #[test]
+    fn none_when_nothing_usable() {
+        assert!(os_pretty_name("").is_none());
+        assert!(os_pretty_name("ID=weird\n").is_none());
+        // 空值不算数，否则系统那栏会显示成空字符串而不是降级
+        assert!(os_pretty_name("PRETTY_NAME=\"\"\n").is_none());
+    }
+}
