@@ -9,8 +9,19 @@
 # ---------------------------------------------------------------------------
 set -eu
 
-SRC="crates/pulse-agent/src"
+SRC="src"
 FAIL=0
+
+# 路径不对时必须**响亮地**失败。
+#
+# 这个脚本的每一条检查都是「grep 不到东西 = 通过」。所以只要 $SRC 指错，
+# 全部检查都会静默地假通过 —— 拆仓库时就踩到了：脚本还指着
+# crates/pulse-agent/src，目录早没了，输出照样是一片 ✔。
+if [ ! -d "$SRC" ] || [ -z "$(find "$SRC" -name '*.rs' -print -quit)" ]; then
+  printf '❌ 源码目录 %s 不存在或没有 .rs 文件 —— 检查无法进行\n' "$SRC" >&2
+  printf '   （本脚本靠「grep 不到 = 通过」工作，路径错了会全部假通过）\n' >&2
+  exit 2
+fi
 
 RED=''; GRN=''; RST=''
 if [ -t 1 ]; then RED=$(printf '\033[31m'); GRN=$(printf '\033[32m'); RST=$(printf '\033[0m'); fi
