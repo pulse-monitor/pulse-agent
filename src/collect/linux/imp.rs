@@ -248,12 +248,24 @@ impl LinuxCollector {
             if !seen_dev.insert(m.device.clone()) {
                 continue;
             }
-            let path = if self.roots.rootfs.as_os_str().is_empty() {
-                PathBuf::from(&m.mount_point)
-            } else {
-                self.roots
+            // 挂载点**可能已经在 rootfs 之下**，那样再拼一次就错了。
+            //
+            // Docker 里 `-v /:/rootfs` + PULSE_ROOTFS=/rootfs 时，容器的
+            // /proc/mounts 里宿主根目录的挂载点写的就是 `/rootfs`（不是 `/`）——
+            // 再拼一次得到 /rootfs/rootfs，这个路径不存在，statvfs 直接失败，
+            // 于是磁盘一直显示 0 B（实测踩到）。
+            let path = match self.roots.rootfs.to_str() {
+                None | Some("") => PathBuf::from(&m.mount_point),
+                Some(root)
+                    if m.mount_point == root || m.mount_point.starts_with(&format!("{root}/")) =>
+                {
+                    // 已经是 rootfs 下的绝对路径，直接用
+                    PathBuf::from(&m.mount_point)
+                }
+                Some(_) => self
+                    .roots
                     .rootfs
-                    .join(m.mount_point.trim_start_matches('/'))
+                    .join(m.mount_point.trim_start_matches('/')),
             };
             if let Some((t, u)) = statvfs(&path) {
                 total += t;
@@ -927,6 +939,40 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         // fixture 的 mounts 里只有 /dev/vda1 是 ext4；
         // tmpfs / overlay / proc / sysfs 都不该计入，否则磁盘占用虚高
         assert!(m.disk.total > 0, "应统计到 ext4 挂载点");
+        assert!(m.disk.used <= m.disk.total);
+    }
+
+    /// Docker 里挂载点**本身就带着 rootfs 前缀**，不能再拼一次。
+    ///
+    /// `-v /:/rootfs` + PULSE_ROOTFS=/rootfs 时，容器的 /proc/mounts 里
+    /// 宿主根目录那一行写的是 `/dev/vda3 /rootfs ext4`（挂载点是 /rootfs，
+    /// 不是 /）。原先无脑拼前缀会得到 /rootfs/rootfs —— 不存在的路径，
+    /// statvfs 失败，磁盘一直显示 0 B。
+    #[test]
+    fn disk_handles_mount_points_already_under_rootfs() {
+        let f = Fixture::new();
+        // 造一个「容器视角」的 mounts：挂载点带 /rootfs 前缀
+        let root = f.dir.path().to_path_buf();
+        let inner = root.join("rootfs");
+        std::fs::create_dir_all(&inner).unwrap();
+        f.write(
+            "proc/mounts",
+            &format!(
+                "overlay / overlay rw 0 0\n\
+                 proc /proc proc rw 0 0\n\
+                 /dev/vda3 {} ext4 ro 0 0\n",
+                inner.display()
+            ),
+        );
+        let mut roots = f.roots();
+        roots.rootfs = inner.clone();
+        let mut c = LinuxCollector::with_roots(roots);
+
+        let m = c.sample(&RuntimeConfig::default());
+        assert!(
+            m.disk.total > 0,
+            "挂载点已在 rootfs 之下时不该再拼一次前缀 —— 拼了就是 0"
+        );
         assert!(m.disk.used <= m.disk.total);
     }
 
