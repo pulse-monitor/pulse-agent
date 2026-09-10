@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # workflow 文件本身也要检。语法/上下文错误不会让某个 job 变红 ——
+  # 整个 workflow 直接解析失败、一个 job 都不起，页面上只有一条没有日志的
+  # failure。踩过：secrets 上下文在 step 的 if: 里不可用。
+  workflows:
+    name: Workflow 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: raven-actions/actionlint@v2
+
+  rust:
+    name: Rust（格式 / clippy / 测试）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  # Linux 用 zigbuild 从 ubuntu 交叉编译；
+  # Apple 目标必须在 macOS runner 上原生编 —— 链接要 Xcode SDK，zig 给不了。
+  cross-linux:
+    name: 交叉编译（${{ matrix.target }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # ring 的 build script 要目标平台的 C 编译器，zig 一个顶五个
+      - uses: mlugg/setup-zig@v2
+      - run: cargo install cargo-zigbuild --locked
+      - run: cargo zigbuild --release --target ${{ matrix.target }}
+
+  # Windows 要原生编：zigbuild 顶不了 MSVC。
+  # 本地想提前验 #[cfg(windows)] 的代码，用
+  #   cargo zigbuild --target x86_64-pc-windows-gnu --all-targets
+  # gnu 目标 zig 能顶，够发现编译错误，不用等 CI。
+  cross-windows:
+    name: 交叉编译（x86_64-pc-windows-msvc）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: cargo clippy --all-targets -- -D warnings
+
+  cross-apple:
+    name: 交叉编译（${{ matrix.target }}）
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      # 平台专有代码只有按目标跑 clippy 才查得到 ——
+      # `System::boot_time` 少写一对括号（函数指针当成时间戳）就是这么发现的
+      - run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
+
+  hardening:
+    name: R18 断言（不提权 / 不接受远程指令）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 探针不得具备执行外部命令、监听端口的能力。靠人记是靠不住的
+      - run: sh tools/check-agent-hardening.sh
+
+  deps:
+    name: 依赖审计
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
