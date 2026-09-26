@@ -56,6 +56,12 @@ struct Config {
     /// **是「额外」不是「替换」**：内置的公共 CA 列表照旧生效，
     /// 这里只是往信任集里加。所以配了它也不会让别的连接变得更宽松。
     ca_cert: Option<String>,
+    /// 允许延迟探测下发内网 / 特殊地址目标（`PULSE_ALLOW_PRIVATE_PROBE_TARGETS=1`）。
+    ///
+    /// 默认 **false**：面板被攻陷时，无限制的探测任务会让 agent 变成
+    /// 内网扫描器 / SSRF 跳板。监控内网是合法需求，显式打开即表示
+    /// 「我信任这个面板，把内网探测当作正常功能用」（AM2）。
+    allow_private_probe_targets: bool,
 }
 
 impl Config {
@@ -71,7 +77,7 @@ impl Config {
             bail!(
                 "pulse-agent 不接受命令行参数，收到：{}\n\
                  配置请用环境变量：PULSE_SERVER、PULSE_TOKEN、PULSE_AUTO_UPDATE、\n\
-                 PULSE_UPDATE_BASE、PULSE_CA_CERT。\n\
+                 PULSE_UPDATE_BASE、PULSE_CA_CERT、PULSE_ALLOW_PRIVATE_PROBE_TARGETS。\n\
                  --server、--token 这类参数是**安装脚本**的，不是本程序的。",
                 extra.join(" ")
             );
@@ -98,6 +104,11 @@ impl Config {
         let ca_cert = std::env::var("PULSE_CA_CERT")
             .ok()
             .filter(|s| !s.trim().is_empty());
+        // 内网探测目标放行。默认关闭 —— 见字段注释（AM2）
+        let allow_private_probe_targets = matches!(
+            std::env::var("PULSE_ALLOW_PRIVATE_PROBE_TARGETS").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
 
         Ok(Self {
             server,
@@ -105,6 +116,7 @@ impl Config {
             update_base,
             auto_update,
             ca_cert,
+            allow_private_probe_targets,
         })
     }
 
@@ -255,22 +267,25 @@ enum SessionEnd {
     Upgraded,
 }
 
-/// 在内置公共 CA 之外，**再**信任用户给的 CA 证书。
+/// 构造 TLS 根证书库：内置 Mozilla 公共 CA + 可选的私有 CA（`PULSE_CA_CERT`）。
 ///
-/// 用途：面板用了私有 CA 或自签证书（内网部署、或者还没配域名的时候）。
-/// 默认只信任内置的 Mozilla CA 列表，那种证书会被直接拒掉 ——
-/// 这是对的，但得给用户一条明路，否则「内置 TLS」这个功能等于只能配公网证书。
+/// 面板的 WSS 连接（[`tls_connector`]）与自更新的下载（`update::fetch`）**共用** ——
+/// 私有 CA 部署下两边必须信任同样的 CA 列表，否则更新下载会 TLS 失败，
+/// 用户就可能被迫把更新源降级成明文 http（AM4）。
 ///
 /// **只加不减**：公共 CA 照旧有效，证书链、有效期、主机名一样要验。
 /// 这里没有任何「跳过验证」的开关，也不打算加 —— 那等于把 TLS 关掉还留个假象。
-fn tls_connector(path: &str) -> Result<tokio_tungstenite::Connector> {
+pub(crate) fn root_cert_store(ca_cert: Option<&str>) -> Result<tokio_rustls::rustls::RootCertStore> {
     use rustls_pki_types::pem::PemObject;
-    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+    use tokio_rustls::rustls::RootCertStore;
 
-    let pem = std::fs::read(path).with_context(|| format!("读不到 CA 证书：{path}"))?;
     let mut roots = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
+    let Some(path) = ca_cert else {
+        return Ok(roots);
+    };
+    let pem = std::fs::read(path).with_context(|| format!("读不到 CA 证书：{path}"))?;
     let mut added = 0usize;
     for cert in rustls_pki_types::CertificateDer::pem_slice_iter(&pem) {
         let cert = cert.with_context(|| format!("解析 CA 证书失败：{path}"))?;
@@ -283,6 +298,18 @@ fn tls_connector(path: &str) -> Result<tokio_tungstenite::Connector> {
         bail!("{path} 里没有找到任何证书（PEM 里要有 BEGIN CERTIFICATE 段）");
     }
     info!(path, count = added, "已加载额外信任的 CA");
+    Ok(roots)
+}
+
+/// 在内置公共 CA 之外，**再**信任用户给的 CA 证书。
+///
+/// 用途：面板用了私有 CA 或自签证书（内网部署、或者还没配域名的时候）。
+/// 默认只信任内置的 Mozilla CA 列表，那种证书会被直接拒掉 ——
+/// 这是对的，但得给用户一条明路，否则「内置 TLS」这个功能等于只能配公网证书。
+fn tls_connector(path: &str) -> Result<tokio_tungstenite::Connector> {
+    use tokio_rustls::rustls::ClientConfig;
+
+    let roots = root_cert_store(Some(path))?;
 
     let config = ClientConfig::builder_with_provider(std::sync::Arc::new(
         tokio_rustls::rustls::crypto::ring::default_provider(),
@@ -337,7 +364,12 @@ async fn run_session(
     let (mut tx, mut rx) = stream.split();
 
     // 每次重连都重新探测能力 —— 机器可能加了显卡，管理员可能改了 ping_group_range
-    let facts = collector.facts();
+    //
+    // 运行期配置先取默认值：facts 里的磁盘总量必须和 sample 用同一套
+    // 磁盘过滤口径（LM7），所以 facts 也吃这份配置；server 下发新配置后
+    // 下次重连的 facts 会自动用上新口径
+    let mut runtime = RuntimeConfig::default();
+    let facts = collector.facts(&runtime);
     let icmp_available = facts.capabilities.icmp_unprivileged;
     let mut hello = hello_from(facts);
     // 采集器只知道「这台机器能不能自更新」（有没有内置公钥、目录能不能写），
@@ -349,10 +381,9 @@ async fn run_session(
         .await
         .context("发送 Hello 失败")?;
 
-    let mut runtime = RuntimeConfig::default();
     let mut ticker = new_ticker(runtime.interval_s);
     // 探测器每秒 tick 一次；具体哪个任务到点由它自己判断
-    let mut prober = Prober::new(icmp_available);
+    let mut prober = Prober::new(icmp_available, cfg.allow_private_probe_targets);
     let mut ping_ticker = tokio::time::interval(Duration::from_secs(1));
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat =
@@ -450,7 +481,13 @@ async fn run_session(
                                 info!(%version, "收到升级指令");
                                 // 注意：整条链路的安全判定都在 update::perform 里 ——
                                 // server 给的只有这个版本号，下载源来自本地配置
-                                match update::perform(&cfg.update_base, AGENT_VERSION, &version).await {
+                                match update::perform(
+                                    &cfg.update_base,
+                                    AGENT_VERSION,
+                                    &version,
+                                    cfg.ca_cert.as_deref(),
+                                )
+                                .await {
                                     Ok(true) => return Ok(SessionEnd::Upgraded),
                                     // 拒绝（降级、没公钥）不是错误，继续正常跑
                                     Ok(false) => {}

@@ -119,7 +119,7 @@ impl Default for MacosCollector {
 }
 
 impl Collector for MacosCollector {
-    fn facts(&mut self) -> Facts {
+    fn facts(&mut self, cfg: &RuntimeConfig) -> Facts {
         self.sys.refresh_memory();
         self.disks.refresh(true);
         self.nets.refresh(true);
@@ -138,7 +138,7 @@ impl Collector for MacosCollector {
             virtualization: None, // macOS 上恒为物理机语义
             mem_total: self.sys.total_memory(),
             swap_total: self.sys.total_swap(),
-            disk_total: self.disk_usage(&RuntimeConfig::default()).total,
+            disk_total: self.disk_usage(cfg).total,
             boot_at: System::boot_time() as i64,
             interfaces: self.nets.keys().cloned().collect(),
             capabilities: Capabilities {
