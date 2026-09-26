@@ -61,10 +61,13 @@ fn sample_nvml() -> Option<GpuStat> {
         util: pulse_proto::pct_to_basis_points(util.gpu as f32),
         mem_used: mem.used,
         mem_total: mem.total,
+        // N8：温度读失败（传感器故障、驱动异常）必须让整个 sample 返回 None。
+        // 之前这里是 `unwrap_or(0)` —— 0 会被面板画成「显卡 0.0°C」，
+        // 一个静默的谎言。读不到就是读不到，调用方会跳过整张卡。
         temp: dev
             .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
-            .map(|t| (t as i32) * 10)
-            .unwrap_or(0),
+            .ok()?
+            .map(|t| (t as i32) * 10),
     })
 }
 

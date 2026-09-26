@@ -48,7 +48,10 @@ pub struct Facts {
 pub trait Collector: Send {
     /// 静态信息与能力声明。每次重连时重新探测 —— 机器可能加了显卡、
     /// 管理员可能改了 `ping_group_range`。
-    fn facts(&mut self) -> Facts;
+    ///
+    /// 吃 `cfg` 是为了让 `disk_total` 与 `sample` 用同一套磁盘过滤口径（LM7）：
+    /// 用户配了磁盘过滤后，详情页的总量不能按全部磁盘算、图表按过滤算。
+    fn facts(&mut self, cfg: &RuntimeConfig) -> Facts;
 
     /// 一次采样。**永不 panic**：单个指标取不到就留 `None`。
     fn sample(&mut self, cfg: &RuntimeConfig) -> Metrics;

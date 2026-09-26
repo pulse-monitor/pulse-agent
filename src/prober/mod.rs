@@ -12,7 +12,7 @@
 //! 与 R18「零 capability」直接冲突。
 
 mod icmp;
-mod net;
+pub(crate) mod net;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -25,6 +25,13 @@ use tracing::{debug, warn};
 ///
 /// 任务多时不加限制会突然发起几十个并发连接，容易被 VPS 商家的风控当成扫描。
 const MAX_CONCURRENT: usize = 8;
+
+/// 单次下发的探测任务数上限（AM1）。
+///
+/// 面板被攻陷时，无上限的任务列表能把每台 agent 变成扫描器 / DDoS 放大器：
+/// 每条任务每轮都是数次 DNS + TCP 连接，条数不限等于放大倍数不限。
+/// 超量时**整批拒绝**而不是截断 —— 部分应用会让「哪批先生效」变成不可预测的状态。
+const MAX_TASKS: usize = 64;
 
 /// 结果批量上报的间隔。
 ///
@@ -45,16 +52,20 @@ pub struct Prober {
     last_flush: Instant,
     /// 本机是否支持非特权 ICMP。由 `Capabilities` 探测得出。
     icmp_available: bool,
+    /// 是否允许探测内网 / 特殊地址目标（`PULSE_ALLOW_PRIVATE_PROBE_TARGETS`）。
+    /// 默认 false：面板被攻陷时，探测任务会变成内网扫描与 SSRF 的跳板（AM2）。
+    allow_private_targets: bool,
 }
 
 impl Prober {
-    pub fn new(icmp_available: bool) -> Self {
+    pub fn new(icmp_available: bool, allow_private_targets: bool) -> Self {
         Self {
             tasks: Vec::new(),
             next_due: HashMap::new(),
             pending: Vec::new(),
             last_flush: Instant::now(),
             icmp_available,
+            allow_private_targets,
         }
     }
 
@@ -63,7 +74,30 @@ impl Prober {
     /// 服务端下发的是全量而不是增量 —— 增量省的那点带宽不值得，
     /// 而全量替换不会因为漏掉一条删除消息就永远多探一个目标。
     pub fn set_tasks(&mut self, tasks: Vec<PingTaskSpec>, now: Instant) {
-        let tasks: Vec<_> = tasks.into_iter().map(PingTaskSpec::sanitize).collect();
+        if tasks.len() > MAX_TASKS {
+            warn!(
+                count = tasks.len(),
+                max = MAX_TASKS,
+                "下发的探测任务数超过上限，整批拒绝（旧任务保持不变）"
+            );
+            return;
+        }
+        let allow_private = self.allow_private_targets;
+        let tasks: Vec<_> = tasks
+            .into_iter()
+            .map(PingTaskSpec::sanitize)
+            .filter(|t| {
+                if target_allowed(&task_target_host(t), allow_private) {
+                    return true;
+                }
+                warn!(
+                    id = t.id,
+                    host = %t.host,
+                    "探测目标为内网/保留地址且未显式放行，已过滤（PULSE_ALLOW_PRIVATE_PROBE_TARGETS=1 可放行）"
+                );
+                false
+            })
+            .collect();
         // 已有任务保留原排期：每次下发配置都重新对齐的话，
         // 所有 agent 会在同一时刻探测同一个目标
         let mut next = HashMap::with_capacity(tasks.len());
@@ -211,6 +245,70 @@ async fn probe(task: PingTaskSpec, icmp_available: bool) -> PingResult {
     }
 }
 
+/// 取出一个探测任务的真实目标主机。
+///
+/// HTTP 任务的 `host` 字段是完整 URL，需要先解析；TCP/ICMP 的 `host` 就是主机。
+/// URL 解析失败时返回空串 —— 这种任务在探测时本来就会因解析失败记为丢包，
+/// 这里不提前过滤，保持「解析失败 = 丢包」的一致语义。
+fn task_target_host(task: &PingTaskSpec) -> String {
+    match &task.kind {
+        PingKind::Http { .. } => net::parse_url(&task.host)
+            .map(|(_, host, _, _)| host)
+            .unwrap_or_default(),
+        _ => task.host.clone(),
+    }
+}
+
+/// 探测目标是否允许（AM2）。
+///
+/// 默认拒绝内网与特殊地址：回环、私有网段、链路本地（含云元数据地址
+/// `169.254.169.254`）、未指定、组播。面板被攻陷时，无限制的探测任务
+/// 会让每台 agent 变成内网扫描器 / SSRF 跳板 / 元数据服务读取器。
+///
+/// 合法的内网监控需求用 `PULSE_ALLOW_PRIVATE_PROBE_TARGETS=1` 显式放行。
+///
+/// 已知缺口：主机名不做 DNS 解析（同步解析会阻塞），`internal.example.com`
+/// 这类解析到内网的名字拦不住 —— 开关打开后本函数直接返回 true，
+/// 内网监控本来就是合法需求。
+fn target_allowed(host: &str, allow_private: bool) -> bool {
+    if allow_private {
+        return true;
+    }
+    let bare = host.trim_matches(|c| c == '[' || c == ']');
+    // "localhost" 这类名字不经过 DNS 也能判定
+    if bare.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    let Ok(ip) = bare.parse::<std::net::IpAddr>() else {
+        return true; // 主机名：见上面的已知缺口说明
+    };
+    !is_restricted_ip(ip)
+}
+
+/// 默认拒绝的目标地址范围。
+fn is_restricted_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    // 注意 MSRV 是 1.82：`Ipv6Addr::is_unique_local` / `is_unicast_link_local`
+    // 要 1.84 才有，所以这里手动判断前缀，避免 clippy::incompatible_msrv
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_multicast()
+                || v4.is_private() // 10/8、172.16/12、192.168/16
+                || v4.is_link_local() // 169.254/16（含云元数据 169.254.169.254）
+        }
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || seg0 & 0xfe00 == 0xfc00 // fc00::/7 唯一本地地址
+                || seg0 & 0xffc0 == 0xfe80 // fe80::/10 链路本地单播
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,7 +386,8 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         tokio::spawn(async move { while l.accept().await.is_ok() {} });
 
-        let mut p = Prober::new(false);
+        // 测的是调度逻辑，目标 127.0.0.1 需要显式放行内网探测
+        let mut p = Prober::new(false, true);
         let t0 = Instant::now();
         let mut spec = task(1, PingKind::Tcp { port }, "127.0.0.1");
         spec.interval_s = 10;
@@ -313,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn set_tasks_preserves_existing_schedule() {
         // 每次下发配置都重新对齐的话，所有 agent 会同时探测同一个目标
-        let mut p = Prober::new(false);
+        let mut p = Prober::new(false, false);
         let t0 = Instant::now();
         p.set_tasks(vec![task(1, PingKind::Tcp { port: 1 }, "h")], t0);
         let due = p.next_due[&1];
@@ -331,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn removed_tasks_stop_being_probed() {
-        let mut p = Prober::new(false);
+        let mut p = Prober::new(false, false);
         let t0 = Instant::now();
         p.set_tasks(vec![task(1, PingKind::Tcp { port: 1 }, "h")], t0);
         p.set_tasks(vec![], t0);
@@ -344,7 +443,7 @@ mod tests {
         // 回归测试：存储层最细就是 1 分钟，探测间隔 <60 秒时同一分钟会有多次结果。
         // 不合并的话服务端 upsert 只留下最后一次 —— 10 秒间隔下 5/6 的探测白做，
         // 丢包率也只反映最后那一次。实测中就是靠「7 分钟只落了 28 行」发现的。
-        let mut p = Prober::new(false);
+        let mut p = Prober::new(false, false);
         p.merge(PingResult {
             task_id: 1,
             ts: 60,
@@ -397,7 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn merging_a_total_loss_round_keeps_rtt_from_the_good_one() {
-        let mut p = Prober::new(false);
+        let mut p = Prober::new(false, false);
         p.merge(PingResult {
             task_id: 1,
             ts: 60,
@@ -425,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_flag_is_sticky_across_merges() {
-        let mut p = Prober::new(false);
+        let mut p = Prober::new(false, false);
         p.merge(PingResult {
             task_id: 1,
             ts: 60,
@@ -447,7 +546,7 @@ mod tests {
     #[tokio::test]
     async fn pending_buffer_is_bounded() {
         // 网络长时间不通时缓冲不能无限涨
-        let mut p = Prober::new(false);
+        let mut p = Prober::new(false, false);
         p.pending = (0..5000)
             .map(|i| PingResult {
                 task_id: 1,
@@ -463,12 +562,101 @@ mod tests {
     #[tokio::test]
     async fn hostile_task_spec_is_clamped_before_use() {
         // 下发的任务会变成真实的出网连接
-        let mut p = Prober::new(false);
+        let mut p = Prober::new(false, false);
         let mut t = task(1, PingKind::Tcp { port: 1 }, "h");
         t.interval_s = 0;
         t.packets = 255;
         p.set_tasks(vec![t], Instant::now());
         assert_eq!(p.tasks[0].interval_s, PingTaskSpec::MIN_INTERVAL_S);
         assert_eq!(p.tasks[0].packets, PingTaskSpec::MAX_PACKETS);
+    }
+
+    #[test]
+    fn oversized_task_batch_is_rejected_whole() {
+        // AM1：超量时整批拒绝，旧任务保持不变 —— 不能部分应用
+        let mut p = Prober::new(false, false);
+        let t0 = Instant::now();
+        p.set_tasks(vec![task(1, PingKind::Tcp { port: 1 }, "h")], t0);
+        assert_eq!(p.tasks.len(), 1);
+
+        let big: Vec<_> = (0..MAX_TASKS as u32 + 1)
+            .map(|i| task(i, PingKind::Tcp { port: 1 }, "h"))
+            .collect();
+        p.set_tasks(big, t0);
+        assert_eq!(p.tasks.len(), 1, "超量批次必须整批拒绝");
+        assert_eq!(p.tasks[0].id, 1, "旧任务必须保持不变");
+
+        // 恰好上限是允许的
+        let ok: Vec<_> = (0..MAX_TASKS as u32)
+            .map(|i| task(i, PingKind::Tcp { port: 1 }, "h"))
+            .collect();
+        p.set_tasks(ok, t0);
+        assert_eq!(p.tasks.len(), MAX_TASKS);
+    }
+
+    #[test]
+    fn private_targets_are_filtered_by_default() {
+        // AM2：默认拒绝内网 / 特殊地址
+        for host in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "10.0.0.1",
+            "172.16.5.4",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "[::1]",
+            "localhost",
+            "LOCALHOST",
+        ] {
+            assert!(!target_allowed(host, false), "{host} 默认应当被拒绝");
+            assert!(target_allowed(host, true), "{host} 在显式放行后应当允许");
+        }
+        // 公网地址与普通主机名不受影响
+        for host in ["8.8.8.8", "1.1.1.1", "2001:db8::1", "example.com"] {
+            assert!(target_allowed(host, false), "{host} 不应当被误杀");
+        }
+    }
+
+    #[test]
+    fn set_tasks_filters_private_targets() {
+        let mut p = Prober::new(false, false);
+        let t0 = Instant::now();
+        p.set_tasks(
+            vec![
+                task(1, PingKind::Tcp { port: 443 }, "127.0.0.1"),
+                task(2, PingKind::Tcp { port: 443 }, "8.8.8.8"),
+                task(
+                    3,
+                    PingKind::Http {
+                        expect_status: None,
+                    },
+                    "http://192.168.1.1/",
+                ),
+                task(
+                    4,
+                    PingKind::Http {
+                        expect_status: None,
+                    },
+                    "https://example.com/health",
+                ),
+            ],
+            t0,
+        );
+        let ids: Vec<u32> = p.tasks.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![2, 4], "内网目标（TCP 与 HTTP）都应当被过滤");
+    }
+
+    #[test]
+    fn allow_private_targets_keeps_intranet_monitoring_working() {
+        // 合法的内网监控需求：开关打开后 127.0.0.1 这类目标正常下发
+        let mut p = Prober::new(false, true);
+        p.set_tasks(
+            vec![task(1, PingKind::Tcp { port: 443 }, "10.0.0.5")],
+            Instant::now(),
+        );
+        assert_eq!(p.tasks.len(), 1);
     }
 }

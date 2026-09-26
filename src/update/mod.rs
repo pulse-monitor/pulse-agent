@@ -105,37 +105,58 @@ pub fn commit(pending: &Pending) {
     Paths::beside(&exe).commit();
 }
 
-/// 试用期已过且仍未连上 → 回滚并退出，由服务管理器拉起旧版本。
+/// 试用期已过且仍未连上 → 回滚；回滚成功则退出，由服务管理器拉起旧版本。
 ///
-/// **不返回** —— 回滚成功就退出。回滚失败则如实记错误并继续用新版本跑，
-/// 因为此时既回不去、退出也只会陷入重启循环。
-pub fn rollback_and_exit(pending: &Pending) -> ! {
+/// **回滚失败时不退出** —— 继续用当前版本运行并记 error 告警人工介入。
+/// 退出只会让服务管理器反复拉起，而状态文件还在、试用期已过，
+/// 每次启动都会再次判定回滚失败 → 无限重启循环（S2）。
+pub fn rollback_and_exit(pending: &Pending) {
     let exe = std::env::current_exe().expect("拿不到自身路径就没法回滚");
     let paths = Paths::beside(&exe);
     error!(
         from = %pending.from_version, to = %pending.to_version, trial_s = state::TRIAL_SECS,
         "新版本在试用期内没能连上面板，回滚到上一个版本"
     );
-    match paths.rollback() {
-        Ok(()) => {
-            info!("已恢复上一个版本，退出等待服务管理器重启");
-            std::process::exit(0)
-        }
-        Err(e) => {
-            error!("回滚失败: {e}。将继续用当前版本运行，请人工介入");
-            // 退出会变成重启循环，反而更糟
-            std::process::exit(1)
-        }
+    let result = paths.rollback();
+    if should_exit_after_rollback(&result) {
+        info!("已恢复上一个版本，退出等待服务管理器重启");
+        std::process::exit(0);
     }
+    // 落到这里 = 回滚失败：备份丢了或目录不可写。此时既回不去，
+    // 退出也只会陷入重启循环 —— 继续用当前版本跑，等人工介入。
+    //
+    // 注意：故意**不删**状态文件。删了它，下次启动会当成「一切正常」，
+    // 这次回滚失败就彻底没人知道了；留着它，每次启动的 warn 日志都会
+    // 提醒有人来修 —— 而当前版本已经是新版本，`classify` 不会把它
+    // 再判成 OnTrial，也就不会触发新的回滚尝试。
+    if let Err(e) = &result {
+        error!("回滚失败: {e}");
+    }
+    error!(
+        from = %pending.from_version, to = %pending.to_version,
+        "无法恢复旧版本，继续用当前版本运行，请人工介入排查"
+    );
+}
+
+/// 回滚之后是否应当退出进程。纯函数，把 S2 的约定钉死在测试里：
+///
+/// - 回滚成功 → 退出，让服务管理器拉起旧版本
+/// - 回滚失败 → **绝不退出**（见 [`rollback_and_exit`]）
+fn should_exit_after_rollback(result: &std::io::Result<()>) -> bool {
+    result.is_ok()
 }
 
 /// 执行一次更新。返回 `Ok(true)` 表示已换好二进制、调用方应当退出让服务管理器重启。
 ///
 /// 每一步失败都**放弃更新**并返回 `Ok(false)` 或 `Err`，绝不「尽力而为地继续」。
+///
+/// `ca_cert`：用户配置的私有 CA（`PULSE_CA_CERT`），更新下载与面板 WSS 连接
+/// 信任同样的 CA 列表 —— 否则私有 CA 部署下用户会被迫把更新源降级成 http（AM4）。
 pub async fn perform(
     update_base: &str,
     current_version: &str,
     target_version: &str,
+    ca_cert: Option<&str>,
 ) -> anyhow::Result<bool> {
     let exe = std::env::current_exe()?;
     perform_at(
@@ -143,6 +164,7 @@ pub async fn perform(
         update_base,
         current_version,
         target_version,
+        ca_cert,
     )
     .await
 }
@@ -155,6 +177,7 @@ pub async fn perform_at(
     update_base: &str,
     current_version: &str,
     target_version: &str,
+    ca_cert: Option<&str>,
 ) -> anyhow::Result<bool> {
     // 防线 4：版本单调。放在最前面 —— 后面每一步都要花网络和磁盘
     if !manifest::is_upgrade(current_version, target_version) {
@@ -163,6 +186,18 @@ pub async fn perform_at(
             target = target_version,
             "拒绝更新：目标版本不高于当前版本（防降级）"
         );
+        return Ok(false);
+    }
+    // 更新源必须走 https。明文 http 下中间人能替换的虽然过不了验签，
+    // 但能喂超大文件打爆磁盘、能无限重定向挂住 agent ——
+    // 更重要的是「能配 http」本身会诱使用户在私有 CA 场景下降级（S1b）。
+    // 本地联调用的是下面的单步函数（测试里那个 `run`），不受这条限制。
+    if update_base
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("http://")
+    {
+        warn!("拒绝更新：PULSE_UPDATE_BASE 必须使用 https，拒绝明文 http");
         return Ok(false);
     }
     let pubkey = verify::builtin_pubkey();
@@ -180,18 +215,22 @@ pub async fn perform_at(
     let b_url = format!("{base}/v{target_version}/{asset}");
 
     info!(version = target_version, %asset, "开始下载更新");
-    let manifest_bytes = fetch::get(&m_url, MAX_TEXT).await?;
-    let sig_text = String::from_utf8(fetch::get(&s_url, MAX_TEXT).await?)
+    let manifest_bytes = fetch::get(&m_url, MAX_TEXT, ca_cert).await?;
+    let sig_text = String::from_utf8(fetch::get(&s_url, MAX_TEXT, ca_cert).await?)
         .map_err(|_| anyhow::anyhow!("签名文件不是有效的 UTF-8"))?;
 
     // 防线 2：先验签，再看清单内容。顺序不能反 ——
     // 未验签的清单里的任何一个字节都不该被信任
     verify::verify_manifest(pubkey, &manifest_bytes, &sig_text)
         .map_err(|e| anyhow::anyhow!("清单验签失败: {e}"))?;
+    // 为将来的密钥轮换留协议位：把这次签名的 keynum 记进日志（S1a）
+    if let Some(keynum) = verify::signature_keynum(&sig_text) {
+        info!(keynum = %keynum, "更新清单签名校验通过");
+    }
     let manifest_text =
         String::from_utf8(manifest_bytes).map_err(|_| anyhow::anyhow!("清单不是有效的 UTF-8"))?;
 
-    let bin = fetch::get(&b_url, MAX_BINARY).await?;
+    let bin = fetch::get(&b_url, MAX_BINARY, ca_cert).await?;
     // 防线 3
     verify::verify_binary(&manifest_text, &asset, &bin)
         .map_err(|e| anyhow::anyhow!("二进制校验失败: {e}"))?;
@@ -203,22 +242,29 @@ pub async fn perform_at(
 
 /// 把新二进制换上去，并写下待定状态（防线 5 的前半段）。
 ///
-/// 顺序很重要：**先备份、再落盘、最后写状态文件**。
-/// 状态文件是「试用期开始」的唯一标志，它必须在二进制确实换好之后才出现，
-/// 否则一次中途失败会让下次启动误以为在试用一个根本没换上的版本。
+/// 顺序很重要：**先备份、再写状态、最后一次原子 rename 换二进制**。
+///
+/// 原来的顺序是「先 rename(current→backup)、再 rename(tmp→current)、最后写状态」，
+/// 两个 rename 之间崩溃会让 current 彻底消失 —— 下次连二进制都起不来，
+/// 状态机再完善也救不了（LM4）。现在的顺序下，最后一步是单次原子 rename，
+/// current 在任何时刻都不会缺失，各种崩溃窗口都落在现有状态机的处理范围内：
+/// - 崩在写状态之前 → 无状态文件 → 正常启动，旧二进制完好
+/// - 崩在写状态与 rename 之间 → 状态 + 旧二进制 → `classify` 判 `Stale`，自愈清掉
+/// - 崩在 rename 当中 → 原子性保证非旧即新 → `Stale` 自愈或正常进入试用期
 fn swap_in(paths: &Paths, bin: &[u8], from: &str, to: &str) -> anyhow::Result<()> {
     let tmp = paths.current.with_extension("new");
+    let backup_tmp = paths.backup.with_extension("tmp");
 
     std::fs::write(&tmp, bin)?;
     set_executable(&tmp)?;
-    // 备份当前版本。用 rename 而不是 copy：同目录内是原子的，
-    // 且不会出现「拷到一半断电」留下半个文件
-    std::fs::rename(&paths.current, &paths.backup)?;
-    if let Err(e) = std::fs::rename(&tmp, &paths.current) {
-        // 换新失败必须把旧的放回去，否则这台机器上连一个能跑的二进制都没有了
-        let _ = std::fs::rename(&paths.backup, &paths.current);
-        return Err(e.into());
-    }
+    // 先落备份：copy 到临时名再原子 rename。原来用 rename(current→backup)
+    // 是为了避免「拷到一半断电留下半个文件」—— 先 copy 到临时名再 rename
+    // 同样能保证最终的备份要么完整、要么不存在，而 current 全程不受影响。
+    std::fs::copy(&paths.current, &backup_tmp)?;
+    std::fs::rename(&backup_tmp, &paths.backup)?;
+    // 状态文件在**最后一次 rename 之前**写下。试用期的起点是它，
+    // 而 `classify` 里 `Stale` 分支的存在让「状态先于二进制」是安全的：
+    // 状态说要升到 Y、跑起来的还是 X，只会被当成「换二进制没成功」清掉。
     std::fs::write(
         &paths.state,
         Pending {
@@ -228,6 +274,9 @@ fn swap_in(paths: &Paths, bin: &[u8], from: &str, to: &str) -> anyhow::Result<()
         }
         .encode(),
     )?;
+    // 最后一步：单次原子 rename。失败时 current 还是完好的旧二进制，
+    // 状态文件会在下次启动被判 Stale 清掉 —— 不需要像原来那样手动恢复。
+    std::fs::rename(&tmp, &paths.current)?;
     Ok(())
 }
 
@@ -288,8 +337,83 @@ mod tests {
     #[tokio::test]
     async fn refuses_downgrade_before_touching_the_network() {
         // update_base 是一个连不上的地址：如果它真去下载了，这里会是 Err 而不是 Ok(false)
-        let r = perform("http://127.0.0.1:1/nope", "1.0.0", "0.9.0").await;
+        let r = perform("http://127.0.0.1:1/nope", "1.0.0", "0.9.0", None).await;
         assert!(!r.unwrap(), "降级必须在联网之前就被拒绝");
+    }
+
+    /// S1b：更新源必须走 https，明文 http 直接拒绝。
+    #[tokio::test]
+    async fn http_update_base_is_refused_without_touching_the_network() {
+        // 版本号合法（能过防降级检查），卡在 scheme 这一关
+        let r = perform("http://127.0.0.1:1/x", "1.0.0", "9.9.9", None).await;
+        assert!(!r.unwrap(), "http:// 的更新源必须被拒绝");
+        // 大小写与前导空白不能绕过
+        let r = perform("  HTTP://127.0.0.1:1/x", "1.0.0", "9.9.9", None).await;
+        assert!(!r.unwrap(), "HTTP://（大写）也必须被拒绝");
+    }
+
+    /// S2 回归：回滚失败**绝不**退出进程 —— 退出 + 状态文件保留 = 无限重启循环。
+    #[test]
+    fn rollback_failure_does_not_exit() {
+        assert!(
+            should_exit_after_rollback(&Ok(())),
+            "回滚成功应当退出，让服务管理器拉起旧版本"
+        );
+        let e: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "找不到备份",
+        ));
+        assert!(
+            !should_exit_after_rollback(&e),
+            "回滚失败绝不能退出：继续用当前版本跑，等人工介入"
+        );
+    }
+
+    /// LM4 回归：新顺序下崩溃只可能留下「状态文件 + 旧二进制」的组合，
+    /// 启动时必须判 Stale 并自愈 —— 旧二进制必须完好，current 永不缺失。
+    #[test]
+    fn crash_between_state_write_and_rename_self_heals() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = staged(d.path()); // current = OLD BINARY
+                                      // 模拟 swap_in 写完状态文件、最后一次 rename 之前崩溃
+        std::fs::write(&paths.state, p(1_700_000_000).encode()).unwrap();
+        std::fs::write(d.path().join("pulse-agent.old"), b"OLD BINARY").unwrap();
+        std::fs::write(d.path().join("pulse-agent.new"), b"hello\n").unwrap();
+
+        // on_boot 对 Stale 的处理就是 commit()（清状态）；这里验证判定与恢复
+        assert!(
+            matches!(
+                state::classify(paths.read_pending(), "0.0.1"),
+                state::Boot::Stale(_)
+            ),
+            "状态说要升到 0.0.2、跑起来的还是 0.0.1，必须判 Stale"
+        );
+        paths.commit();
+        assert_eq!(
+            std::fs::read(&paths.current).unwrap(),
+            b"OLD BINARY",
+            "旧二进制必须完好无损"
+        );
+        assert!(!paths.state.exists(), "状态文件应当被清掉");
+    }
+
+    /// LM4 的另一半窗口：崩在最后一次 rename 之后（新二进制已就位），
+    /// 试用期必须正常武装，不能当成 Stale 丢掉。
+    #[test]
+    fn crash_after_rename_still_arms_the_trial() {
+        let d = tempfile::tempdir().unwrap();
+        let cur = d.path().join("pulse-agent");
+        std::fs::write(&cur, b"hello\n").unwrap(); // rename 已发生
+        let paths = Paths::beside(&cur);
+        std::fs::write(&paths.state, p(1_700_000_000).encode()).unwrap();
+
+        assert!(
+            matches!(
+                state::classify(paths.read_pending(), "0.0.2"),
+                state::Boot::OnTrial(_)
+            ),
+            "新二进制已就位，必须正常进入试用期"
+        );
     }
 
     // ── 端到端：真起一个 HTTP 服务发更新包，走完整链路 ──────────────
@@ -366,15 +490,17 @@ mod tests {
     }
 
     /// 用给定的资源名跑一次完整流程（绕开 asset_name() 的平台依赖）。
+    /// 测试走明文 http 的本地服务，CA 参数固定 None ——
+    /// scheme 检查只在 perform_at 里做，这个单步 helper 不受影响。
     async fn run(base: &str, paths: &Paths, bin_name: &str) -> anyhow::Result<bool> {
-        let m = fetch::get(&format!("{base}/v0.0.2/SHA256SUMS"), 64 << 10).await?;
+        let m = fetch::get(&format!("{base}/v0.0.2/SHA256SUMS"), 64 << 10, None).await?;
         let sig = String::from_utf8(
-            fetch::get(&format!("{base}/v0.0.2/SHA256SUMS.minisig"), 64 << 10).await?,
+            fetch::get(&format!("{base}/v0.0.2/SHA256SUMS.minisig"), 64 << 10, None).await?,
         )?;
         verify::verify_manifest(PUBKEY, &m, &sig)
             .map_err(|e| anyhow::anyhow!("清单验签失败: {e}"))?;
         let text = String::from_utf8(m)?;
-        let bin = fetch::get(&format!("{base}/v0.0.2/{bin_name}"), 32 << 20).await?;
+        let bin = fetch::get(&format!("{base}/v0.0.2/{bin_name}"), 32 << 20, None).await?;
         verify::verify_binary(&text, bin_name, &bin)
             .map_err(|e| anyhow::anyhow!("二进制校验失败: {e}"))?;
         swap_in(paths, &bin, "0.0.1", "0.0.2")?;
@@ -484,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_unparseable_target_version() {
         for bad in ["", "latest", "1.0", "1.0.1-rc1", "../../etc/passwd"] {
-            let r = perform("http://127.0.0.1:1/nope", "1.0.0", bad).await;
+            let r = perform("http://127.0.0.1:1/nope", "1.0.0", bad, None).await;
             assert!(!r.unwrap(), "不该接受版本号 {bad:?}");
         }
     }

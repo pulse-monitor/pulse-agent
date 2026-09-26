@@ -66,6 +66,74 @@ pub fn verify_binary(manifest: &str, filename: &str, bytes: &[u8]) -> Result<(),
     Ok(())
 }
 
+/// 从 minisign 签名文本里提取 keynum（签名块 base64 解码后的第 3–10 字节，hex）。
+///
+/// minisign-verify 在验签时已经校验了「签名里的 keynum == 公钥里的 keynum」
+/// （对不上就是 `SignatureMismatch`），这里只是把它解出来 —— 调用方在验签
+/// 通过后记进日志。将来做密钥轮换时不用改验签逻辑，凭日志就能看出
+/// 是哪把钥匙签的包：这是为轮换留的协议位（S1）。
+///
+/// 手写最小 base64 解码：签名块固定 74 字节，为它引一个 base64 库不值得；
+/// 解码只用于日志展示，失败返回 `None`，不影响验签结果。
+pub fn signature_keynum(signature: &str) -> Option<String> {
+    let b64 = signature.lines().nth(1)?.trim();
+    let raw = decode_base64(b64)?;
+    if raw.len() != 74 {
+        return None;
+    }
+    Some(
+        raw[2..10]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    )
+}
+
+/// 最小 base64 解码（标准字母表）。只处理单行、无空白的输入。
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let s = s.as_bytes();
+    if s.is_empty() || s.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    for chunk in s.chunks(4) {
+        let mut n = 0u32;
+        let mut pad = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            if c == b'=' {
+                if i < 2 || pad > 2 {
+                    return None; // padding 只能出现在末尾 1–2 个
+                }
+                pad += 1;
+            } else {
+                if pad > 0 {
+                    return None; // padding 后面不能再有数据
+                }
+                n = (n << 6) | u32::from(val(c)?);
+            }
+        }
+        n <<= 6 * pad;
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 /// 发布产物里本平台那一行的文件名。构建期由 `build.rs` 注入目标三元组。
 pub fn asset_name() -> String {
     let target = env!("PULSE_TARGET");
@@ -161,5 +229,41 @@ mod tests {
         let n = asset_name();
         assert!(n.starts_with("pulse-agent-"));
         assert!(n.contains(env!("PULSE_TARGET")));
+    }
+
+    #[test]
+    fn keynum_is_extracted_from_a_genuine_signature() {
+        // keynum 必须和公钥里的 key ID 一致 —— minisign 公钥的 base64 解出来是
+        // "Ed" + keyid[8] + pubkey[32]，取第 3–10 字节对比
+        let keynum = signature_keynum(SIG).expect("应当解出 keynum");
+        assert_eq!(keynum.len(), 16, "8 字节 hex");
+
+        let pub_b64 = PUBKEY.lines().nth(1).expect("公钥要有 base64 那一行");
+        let pub_raw = decode_base64(pub_b64.trim()).expect("公钥 base64 应当合法");
+        assert_eq!(pub_raw.len(), 42, "Ed(2) + keyid(8) + pubkey(32)");
+        let from_pub: String = pub_raw[2..10].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(keynum, from_pub, "签名里的 keynum 必须和公钥的 key ID 一致");
+    }
+
+    #[test]
+    fn keynum_extraction_rejects_garbage() {
+        assert!(signature_keynum("").is_none());
+        assert!(signature_keynum("只有一行").is_none());
+        assert!(signature_keynum("untrusted comment: x\n不是base64!!\n").is_none());
+        // 长度不对的签名块
+        assert!(signature_keynum("untrusted comment: x\nQUJD\n").is_none());
+    }
+
+    #[test]
+    fn base64_decoder_handles_padding() {
+        // "hello\n"：无 padding、1 个 padding、2 个 padding 各一种
+        assert_eq!(decode_base64("aGVsbG8K"), Some(b"hello\n".to_vec()));
+        assert_eq!(decode_base64("YWI="), Some(b"ab".to_vec()));
+        assert_eq!(decode_base64("YQ=="), Some(b"a".to_vec()));
+        // 非法输入
+        assert!(decode_base64("abc").is_none(), "长度必须对齐到 4");
+        assert!(decode_base64("====").is_none());
+        assert!(decode_base64("AB=C").is_none(), "padding 后不能有数据");
+        assert!(decode_base64("A**=").is_none(), "非法字符");
     }
 }

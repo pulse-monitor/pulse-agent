@@ -297,7 +297,7 @@ impl Default for LinuxCollector {
 }
 
 impl Collector for LinuxCollector {
-    fn facts(&mut self) -> Facts {
+    fn facts(&mut self, cfg: &RuntimeConfig) -> Facts {
         self.probe_capabilities();
         let stat = self.roots.proc("stat");
         let cpuinfo = self.roots.proc("cpuinfo");
@@ -335,7 +335,7 @@ impl Collector for LinuxCollector {
             virtualization: self.detect_virtualization(cpuinfo.as_deref()),
             mem_total: mem.total,
             swap_total: mem.swap_total,
-            disk_total: self.read_disk(&RuntimeConfig::default()).total,
+            disk_total: self.read_disk(cfg).total,
             boot_at: stat.as_deref().and_then(parse::btime).unwrap_or(0),
             interfaces: ifaces,
             capabilities: self.caps.clone(),
@@ -806,7 +806,7 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
             ),
         );
         let mut c = f.collector();
-        let facts = c.facts();
+        let facts = c.facts(&RuntimeConfig::default());
         assert!(
             !facts.capabilities.proc_count,
             "hidepid 下 proc_count 能力必须为 false"
@@ -824,7 +824,7 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         let f = Fixture::new();
         f.remove("proc/1");
         let mut c = f.collector();
-        assert!(!c.facts().capabilities.proc_count);
+        assert!(!c.facts(&RuntimeConfig::default()).capabilities.proc_count);
     }
 
     #[test]
@@ -835,7 +835,7 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         f.write("sys/fs/cgroup/memory.max", "1073741824\n"); // 1 GiB
         let mut c = f.collector();
 
-        let facts = c.facts();
+        let facts = c.facts(&RuntimeConfig::default());
         assert!(
             facts.capabilities.cgroup_limited,
             "必须标记出「规格来自 cgroup」"
@@ -857,7 +857,7 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         let f = Fixture::new();
         f.write("sys/fs/cgroup/memory.max", "max\n");
         let mut c = f.collector();
-        let facts = c.facts();
+        let facts = c.facts(&RuntimeConfig::default());
         assert!(!facts.capabilities.cgroup_limited);
         assert_eq!(facts.mem_total, 4030264 * 1024);
     }
@@ -872,7 +872,11 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         );
         let mut c = f.collector();
         // 挂了 lxcfs 说明 /proc 已经是容器视角，不必再提示用户
-        assert!(!c.facts().capabilities.cgroup_limited);
+        assert!(
+            !c.facts(&RuntimeConfig::default())
+                .capabilities
+                .cgroup_limited
+        );
     }
 
     #[test]
@@ -881,7 +885,7 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         // 报 0°C 会在前端画出一条假的零线。
         let f = Fixture::new();
         let mut c = f.collector();
-        assert!(!c.facts().capabilities.temperature);
+        assert!(!c.facts(&RuntimeConfig::default()).capabilities.temperature);
         assert_eq!(c.sample(&RuntimeConfig::default()).cpu_temp, None);
     }
 
@@ -892,32 +896,57 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         f.write("sys/class/hwmon/hwmon1/temp1_input", "58000\n");
         f.write("sys/class/hwmon/hwmon1/temp2_input", "999000\n"); // 坏传感器，应丢弃
         let mut c = f.collector();
-        assert!(c.facts().capabilities.temperature);
+        assert!(c.facts(&RuntimeConfig::default()).capabilities.temperature);
         assert_eq!(c.sample(&RuntimeConfig::default()).cpu_temp, Some(580));
     }
 
     #[test]
     fn icmp_capability_follows_ping_group_range() {
         let f = Fixture::new();
-        assert!(f.collector().facts().capabilities.icmp_unprivileged);
+        assert!(
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .capabilities
+                .icmp_unprivileged
+        );
 
         // 内核默认 "1 0" 是空区间 —— 禁用，延迟监控要回落 TCP
         f.write("proc/sys/net/ipv4/ping_group_range", "1 0\n");
-        assert!(!f.collector().facts().capabilities.icmp_unprivileged);
+        assert!(
+            !f.collector()
+                .facts(&RuntimeConfig::default())
+                .capabilities
+                .icmp_unprivileged
+        );
     }
 
     #[test]
     fn detects_virtualization_from_dmi_then_cpuid() {
         let f = Fixture::new();
         // 无 DMI（aarch64 常见）→ 回落 CPUID 的 hypervisor 位
-        assert_eq!(f.collector().facts().virtualization.as_deref(), Some("vm"));
+        assert_eq!(
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
+            Some("vm")
+        );
 
         f.write("sys/class/dmi/id/product_name", "KVM\n");
-        assert_eq!(f.collector().facts().virtualization.as_deref(), Some("kvm"));
+        assert_eq!(
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
+            Some("kvm")
+        );
 
         f.write("sys/class/dmi/id/product_name", "VMware Virtual Platform\n");
         assert_eq!(
-            f.collector().facts().virtualization.as_deref(),
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
             Some("vmware")
         );
 
@@ -929,12 +958,21 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
             "Standard PC (Q35 + ICH9, 2009)\n",
         );
         f.write("sys/class/dmi/id/sys_vendor", "QEMU\n");
-        assert_eq!(f.collector().facts().virtualization.as_deref(), Some("kvm"));
+        assert_eq!(
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
+            Some("kvm")
+        );
 
         // 容器优先于 DMI
         f.write("proc/1/cgroup", "0::/docker/abc123\n");
         assert_eq!(
-            f.collector().facts().virtualization.as_deref(),
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
             Some("docker")
         );
     }
@@ -944,7 +982,10 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         let f = Fixture::new();
         f.write("proc/cpuinfo", &CPUINFO.replace(" hypervisor", ""));
         assert_eq!(
-            f.collector().facts().virtualization.as_deref(),
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
             Some("none")
         );
     }
@@ -1007,7 +1048,7 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
             sys: dir.path().join("nonexistent"),
             rootfs: PathBuf::new(),
         });
-        let facts = c.facts();
+        let facts = c.facts(&RuntimeConfig::default());
         assert!(!facts.capabilities.proc_count);
         assert!(!facts.capabilities.tcp_conn_count);
 

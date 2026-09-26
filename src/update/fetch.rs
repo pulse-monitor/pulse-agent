@@ -22,10 +22,12 @@ const MAX_REDIRECTS: usize = 3;
 ///
 /// 超过上限直接报错而不是截断 —— 截断后的内容拿去校验必然失败，
 /// 但错误信息会指向「校验不通过」，把真正的原因（超大响应）藏起来。
-pub async fn get(url: &str, max: usize) -> Result<Vec<u8>> {
+///
+/// `ca_cert`：用户配置的私有 CA（`PULSE_CA_CERT`）。`None` 时只信任内置公共 CA。
+pub async fn get(url: &str, max: usize, ca_cert: Option<&str>) -> Result<Vec<u8>> {
     let mut url = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
-        let (status, headers, body) = tokio::time::timeout(TIMEOUT, get_once(&url, max))
+        let (status, headers, body) = tokio::time::timeout(TIMEOUT, get_once(&url, max, ca_cert))
             .await
             .with_context(|| format!("下载 {url} 超时"))??;
         match status {
@@ -41,7 +43,7 @@ pub async fn get(url: &str, max: usize) -> Result<Vec<u8>> {
     bail!("重定向次数超过 {MAX_REDIRECTS} 次")
 }
 
-async fn get_once(url: &str, max: usize) -> Result<(u16, String, Vec<u8>)> {
+async fn get_once(url: &str, max: usize, ca_cert: Option<&str>) -> Result<(u16, String, Vec<u8>)> {
     let (https, host, port, path) = parse_url(url).with_context(|| format!("非法 URL: {url}"))?;
     let stream = TcpStream::connect((host.as_str(), port))
         .await
@@ -51,7 +53,7 @@ async fn get_once(url: &str, max: usize) -> Result<(u16, String, Vec<u8>)> {
          Accept: */*\r\nConnection: close\r\n\r\n"
     );
     let raw = if https {
-        let s = tls_connect(stream, &host).await?;
+        let s = tls_connect(stream, &host, ca_cert).await?;
         exchange(s, &req, max).await?
     } else {
         exchange(stream, &req, max).await?
@@ -62,13 +64,14 @@ async fn get_once(url: &str, max: usize) -> Result<(u16, String, Vec<u8>)> {
 async fn tls_connect(
     stream: TcpStream,
     host: &str,
+    ca_cert: Option<&str>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+    use tokio_rustls::rustls::ClientConfig;
     use tokio_rustls::TlsConnector;
 
-    let roots = RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
+    // 与面板 WSS 连接共用同一份 CA 加载逻辑（crate::root_cert_store）：
+    // 私有 CA 部署下，更新下载必须信任同样的 CA，否则用户会被迫降级 http（AM4）
+    let roots = crate::root_cert_store(ca_cert)?;
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -191,6 +194,9 @@ fn resolve(base: &str, loc: &str) -> Option<String> {
 }
 
 /// 极简 URL 解析：`(是否 https, 主机, 端口, 路径)`。
+///
+/// 主机部分返回**去括号**的 IPv6 字面量 —— 连接时用 `(host, port)` 元组，
+/// 标准库会先按 IP 解析，`::1` 不需要括号；`Host` 头与 SNI 同样用裸地址。
 fn parse_url(url: &str) -> Option<(bool, String, u16, String)> {
     let (https, rest) = match url.strip_prefix("https://") {
         Some(r) => (true, r),
@@ -204,13 +210,9 @@ fn parse_url(url: &str) -> Option<(bool, String, u16, String)> {
     if authority.is_empty() || authority.contains('@') {
         return None; // 不支持 userinfo：更新源不该带凭据
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-            (h, p.parse().ok()?)
-        }
-        _ => (authority, if https { 443 } else { 80 }),
-    };
-    Some((https, host.to_string(), port, path.to_string()))
+    let default_port = if https { 443 } else { 80 };
+    let (host, port) = crate::prober::net::split_host_port(authority, default_port)?;
+    Some((https, host, port, path.to_string()))
 }
 
 #[cfg(test)]
