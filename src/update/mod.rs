@@ -192,7 +192,11 @@ pub async fn perform_at(
     // 但能喂超大文件打爆磁盘、能无限重定向挂住 agent ——
     // 更重要的是「能配 http」本身会诱使用户在私有 CA 场景下降级（S1b）。
     // 本地联调用的是下面的单步函数（测试里那个 `run`），不受这条限制。
-    if update_base.trim_start().to_ascii_lowercase().starts_with("http://") {
+    if update_base
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("http://")
+    {
         warn!("拒绝更新：PULSE_UPDATE_BASE 必须使用 https，拒绝明文 http");
         return Ok(false);
     }
@@ -371,7 +375,7 @@ mod tests {
     fn crash_between_state_write_and_rename_self_heals() {
         let d = tempfile::tempdir().unwrap();
         let paths = staged(d.path()); // current = OLD BINARY
-        // 模拟 swap_in 写完状态文件、最后一次 rename 之前崩溃
+                                      // 模拟 swap_in 写完状态文件、最后一次 rename 之前崩溃
         std::fs::write(&paths.state, p(1_700_000_000).encode()).unwrap();
         std::fs::write(d.path().join("pulse-agent.old"), b"OLD BINARY").unwrap();
         std::fs::write(d.path().join("pulse-agent.new"), b"hello\n").unwrap();

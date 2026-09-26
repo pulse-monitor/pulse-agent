@@ -611,14 +611,8 @@ mod tests {
             "localhost",
             "LOCALHOST",
         ] {
-            assert!(
-                !target_allowed(host, false),
-                "{host} 默认应当被拒绝"
-            );
-            assert!(
-                target_allowed(host, true),
-                "{host} 在显式放行后应当允许"
-            );
+            assert!(!target_allowed(host, false), "{host} 默认应当被拒绝");
+            assert!(target_allowed(host, true), "{host} 在显式放行后应当允许");
         }
         // 公网地址与普通主机名不受影响
         for host in ["8.8.8.8", "1.1.1.1", "2001:db8::1", "example.com"] {
@@ -636,12 +630,16 @@ mod tests {
                 task(2, PingKind::Tcp { port: 443 }, "8.8.8.8"),
                 task(
                     3,
-                    PingKind::Http { expect_status: None },
+                    PingKind::Http {
+                        expect_status: None,
+                    },
                     "http://192.168.1.1/",
                 ),
                 task(
                     4,
-                    PingKind::Http { expect_status: None },
+                    PingKind::Http {
+                        expect_status: None,
+                    },
                     "https://example.com/health",
                 ),
             ],

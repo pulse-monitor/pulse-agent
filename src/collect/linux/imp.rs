@@ -872,7 +872,11 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         );
         let mut c = f.collector();
         // 挂了 lxcfs 说明 /proc 已经是容器视角，不必再提示用户
-        assert!(!c.facts(&RuntimeConfig::default()).capabilities.cgroup_limited);
+        assert!(
+            !c.facts(&RuntimeConfig::default())
+                .capabilities
+                .cgroup_limited
+        );
     }
 
     #[test]
@@ -899,25 +903,50 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
     #[test]
     fn icmp_capability_follows_ping_group_range() {
         let f = Fixture::new();
-        assert!(f.collector().facts(&RuntimeConfig::default()).capabilities.icmp_unprivileged);
+        assert!(
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .capabilities
+                .icmp_unprivileged
+        );
 
         // 内核默认 "1 0" 是空区间 —— 禁用，延迟监控要回落 TCP
         f.write("proc/sys/net/ipv4/ping_group_range", "1 0\n");
-        assert!(!f.collector().facts(&RuntimeConfig::default()).capabilities.icmp_unprivileged);
+        assert!(
+            !f.collector()
+                .facts(&RuntimeConfig::default())
+                .capabilities
+                .icmp_unprivileged
+        );
     }
 
     #[test]
     fn detects_virtualization_from_dmi_then_cpuid() {
         let f = Fixture::new();
         // 无 DMI（aarch64 常见）→ 回落 CPUID 的 hypervisor 位
-        assert_eq!(f.collector().facts(&RuntimeConfig::default()).virtualization.as_deref(), Some("vm"));
+        assert_eq!(
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
+            Some("vm")
+        );
 
         f.write("sys/class/dmi/id/product_name", "KVM\n");
-        assert_eq!(f.collector().facts(&RuntimeConfig::default()).virtualization.as_deref(), Some("kvm"));
+        assert_eq!(
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
+            Some("kvm")
+        );
 
         f.write("sys/class/dmi/id/product_name", "VMware Virtual Platform\n");
         assert_eq!(
-            f.collector().facts(&RuntimeConfig::default()).virtualization.as_deref(),
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
             Some("vmware")
         );
 
@@ -929,12 +958,21 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
             "Standard PC (Q35 + ICH9, 2009)\n",
         );
         f.write("sys/class/dmi/id/sys_vendor", "QEMU\n");
-        assert_eq!(f.collector().facts(&RuntimeConfig::default()).virtualization.as_deref(), Some("kvm"));
+        assert_eq!(
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
+            Some("kvm")
+        );
 
         // 容器优先于 DMI
         f.write("proc/1/cgroup", "0::/docker/abc123\n");
         assert_eq!(
-            f.collector().facts(&RuntimeConfig::default()).virtualization.as_deref(),
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
             Some("docker")
         );
     }
@@ -944,7 +982,10 @@ flags\t\t: fpu vme de pse tsc msr hypervisor lahf_lm
         let f = Fixture::new();
         f.write("proc/cpuinfo", &CPUINFO.replace(" hypervisor", ""));
         assert_eq!(
-            f.collector().facts(&RuntimeConfig::default()).virtualization.as_deref(),
+            f.collector()
+                .facts(&RuntimeConfig::default())
+                .virtualization
+                .as_deref(),
             Some("none")
         );
     }

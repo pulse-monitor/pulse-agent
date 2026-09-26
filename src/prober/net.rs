@@ -53,7 +53,7 @@ pub(crate) fn split_host_port(authority: &str, default_port: u16) -> Option<(Str
         let port = match after.strip_prefix(':') {
             Some(p) if p.chars().all(|c| c.is_ascii_digit()) => p.parse().ok()?,
             None => default_port, // "[::1]" 无端口
-            _ => return None,      // "[::1]:" 尾随冒号、"[::1]:abc" 非法端口：拒绝
+            _ => return None,     // "[::1]:" 尾随冒号、"[::1]:abc" 非法端口：拒绝
         };
         return Some((host.to_string(), port));
     }

@@ -275,7 +275,9 @@ enum SessionEnd {
 ///
 /// **只加不减**：公共 CA 照旧有效，证书链、有效期、主机名一样要验。
 /// 这里没有任何「跳过验证」的开关，也不打算加 —— 那等于把 TLS 关掉还留个假象。
-pub(crate) fn root_cert_store(ca_cert: Option<&str>) -> Result<tokio_rustls::rustls::RootCertStore> {
+pub(crate) fn root_cert_store(
+    ca_cert: Option<&str>,
+) -> Result<tokio_rustls::rustls::RootCertStore> {
     use rustls_pki_types::pem::PemObject;
     use tokio_rustls::rustls::RootCertStore;
 

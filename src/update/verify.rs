@@ -241,10 +241,7 @@ mod tests {
         let pub_b64 = PUBKEY.lines().nth(1).expect("公钥要有 base64 那一行");
         let pub_raw = decode_base64(pub_b64.trim()).expect("公钥 base64 应当合法");
         assert_eq!(pub_raw.len(), 42, "Ed(2) + keyid(8) + pubkey(32)");
-        let from_pub: String = pub_raw[2..10]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let from_pub: String = pub_raw[2..10].iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(keynum, from_pub, "签名里的 keynum 必须和公钥的 key ID 一致");
     }
 
